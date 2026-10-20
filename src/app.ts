@@ -276,28 +276,56 @@ app.get('/health', async (_req, res) => {
   });
 });
 
-/**
- * Per-probe timeout configuration (ms).
- * Each probe has its own independent timeout so a slow dependency only blocks
- * its own result — not all three.
- *
- * Configurable via:
- *   READINESS_DB_TIMEOUT_MS      (default: 2 000)
- *   READINESS_IPFS_TIMEOUT_MS    (default: 5 000)
- *   READINESS_STELLAR_TIMEOUT_MS (default: 5 000)
- */
-function getReadinessTimeouts(): { db: number; ipfs: number; stellar: number } {
-  const parseTimeout = (name: string, fallback: number): number => {
-    const raw = process.env[name];
-    if (raw === undefined) return fallback;
-    const parsed = parseInt(raw, 10);
-    return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
-  };
+async function checkReadiness(): Promise<Record<string, ProbeResult>> {
+  const [dbResult, ipfsResult, stellarResult, indexerResult] = await Promise.all([
+    (async (): Promise<ProbeResult> => {
+      const t0 = Date.now();
+      const outcome = await probeDbWritable(config.readiness.timeouts.dbMs);
+      return { status: outcome === 'ok' ? 'ok' : 'unavailable', ms: Date.now() - t0 };
+    })(),
 
-  return {
-    db: parseTimeout('READINESS_DB_TIMEOUT_MS', 2_000),
-    ipfs: parseTimeout('READINESS_IPFS_TIMEOUT_MS', 5_000),
-    stellar: parseTimeout('READINESS_STELLAR_TIMEOUT_MS', 5_000),
+    // IPFS probe — Pinata connectivity
+    (async (): Promise<ProbeResult> => {
+      const t0 = Date.now();
+      const outcome = await withTimeout(
+        async () => {
+          await checkHealth();
+        },
+        config.readiness.timeouts.ipfsMs,
+      );
+      return { status: outcome === 'ok' ? 'ok' : 'unavailable', ms: Date.now() - t0 };
+    })(),
+
+    // Stellar probe — RPC connectivity (can be disabled via config)
+    (async (): Promise<ProbeResult> => {
+      if (!config.stellarHealthCheckEnabled) {
+        return { status: 'disabled', ms: 0 };
+      }
+      if (stellarBreaker.state === 'OPEN') {
+        return { status: 'unavailable', ms: 0 };
+      }
+      const t0 = Date.now();
+      const outcome = await withTimeout(
+        async () => {
+          const ok = await stellarHealth();
+          if (!ok) throw new Error('stellar unhealthy');
+        },
+        config.readiness.timeouts.stellarMs,
+      );
+      return { status: outcome === 'ok' ? 'ok' : 'unavailable', ms: Date.now() - t0 };
+    })(),
+    (async (): Promise<'ok' | 'unavailable' | 'disabled'> => {
+      // If max lag is 0, the check is disabled
+      if (config.readiness.maxLag === 0) return 'disabled';
+      
+      // During grace period, always report ok regardless of lag
+      const uptimeMs = Date.now() - processStartTime;
+      if (uptimeMs < config.readiness.gracePeriodMs) return 'ok';
+      
+      // After grace period, check if lag is within threshold
+      return indexerLedgerLag <= config.readiness.maxLag ? 'ok' : 'unavailable';
+    })(),
+  ]);
   };
 }
 
@@ -307,8 +335,6 @@ export interface ProbeResult {
 }
 
 async function checkReadiness(): Promise<Record<string, ProbeResult>> {
-  const timeouts = getReadinessTimeouts();
-
   const [dbResult, ipfsResult, stellarResult, indexerResult] = await Promise.all([
     (async (): Promise<ProbeResult> => {
       const t0 = Date.now();

@@ -668,21 +668,7 @@ const config = {
   /** Base retry interval in milliseconds for SSE reconnect hints (default: 5000 ms). */
   sseRetryMs: parseNumericEnv('SSE_RETRY_MS', process.env.SSE_RETRY_MS, 5000, { min: 1, integer: true }),
 
-  /**
-   * Maximum indexer ledger lag (in ledgers) allowed for readiness check.
-   * If the indexer is more than this many ledgers behind the chain tip,
-   * the readiness check will report the indexer as unavailable.
-   * Default: 100 ledgers. Set to 0 to disable the lag check.
-   */
-  readinessMaxLag: parseNumericEnv('READINESS_MAX_LAG', process.env.READINESS_MAX_LAG, 100, { min: 0, integer: true }),
 
-  /**
-   * Startup grace period in milliseconds for the readiness lag check.
-   * After process startup, the indexer is allowed to lag without failing
-   * readiness for this duration (to accommodate initial sync from persisted cursor).
-   * Default: 5 minutes. Set to 0 to disable the grace period.
-   */
-  readinessGracePeriodMs: parseNumericEnv('READINESS_GRACE_PERIOD_MS', process.env.READINESS_GRACE_PERIOD_MS, 5 * 60 * 1000, { min: 0, integer: true }),
 
   /**
    * Log redaction configuration for sensitive data in production logs.
@@ -714,14 +700,22 @@ const config = {
 
   // ── Readiness / health check timeouts ──────────────────────────────────
   // Per-component timeout for readiness probes (#1317)
-  readinessDb: {
-    timeoutMs: parseNumericEnv('READINESS_DB_TIMEOUT_MS', process.env.READINESS_DB_TIMEOUT_MS, 2000, { min: 1, integer: true }),
+  readiness: {
+    timeouts: {
+      dbMs: parseNumericEnv('READINESS_DB_TIMEOUT_MS', process.env.READINESS_DB_TIMEOUT_MS, 2000, { min: 100, max: 30000, integer: true }),
+      ipfsMs: parseNumericEnv('READINESS_IPFS_TIMEOUT_MS', process.env.READINESS_IPFS_TIMEOUT_MS, 5000, { min: 100, max: 30000, integer: true }),
+      stellarMs: parseNumericEnv('READINESS_STELLAR_TIMEOUT_MS', process.env.READINESS_STELLAR_TIMEOUT_MS, 5000, { min: 100, max: 30000, integer: true }),
+    },
+    maxLag: parseNumericEnv('READINESS_MAX_LAG', process.env.READINESS_MAX_LAG, 100, { min: 0, integer: true }),
+    gracePeriodMs: parseNumericEnv('READINESS_GRACE_PERIOD_MS', process.env.READINESS_GRACE_PERIOD_MS, 5 * 60 * 1000, { min: 0, integer: true }),
   },
-  readinessIpfs: {
-    timeoutMs: parseNumericEnv('READINESS_IPFS_TIMEOUT_MS', process.env.READINESS_IPFS_TIMEOUT_MS, 5000, { min: 1, integer: true }),
-  },
-  readinessStellar: {
-    timeoutMs: parseNumericEnv('READINESS_STELLAR_TIMEOUT_MS', process.env.READINESS_STELLAR_TIMEOUT_MS, 5000, { min: 1, integer: true }),
+
+  // ── SSE settings ──────────────────────────────────────────────────────
+
+  // ── Shutdown configuration ────────────────────────────────────────────
+  shutdown: {
+    timeoutMs: parseNumericEnv('SHUTDOWN_TIMEOUT_MS', process.env.SHUTDOWN_TIMEOUT_MS, 10_000, { min: 1_000, max: 600_000, integer: true }),
+    prestopDelayMs: parseNumericEnv('SHUTDOWN_PRESTOP_DELAY_MS', process.env.SHUTDOWN_PRESTOP_DELAY_MS, 0, { min: 0, max: 120_000, integer: true }),
   },
 
   // ── Server-Sent Events (SSE) ──────────────────────────────────────────
@@ -764,10 +758,12 @@ const config = {
   reindexRateLimitBackoffMs: parseNumericEnv('REINDEX_RATE_LIMIT_BACKOFF_MS', process.env.REINDEX_RATE_LIMIT_BACKOFF_MS, 2000, { min: 1, integer: true }),
 
   // ── Indexer settings ──────────────────────────────────────────────────
-  /** Finality margin: ledgers to hold back from tip to avoid reorgs. */
-  indexerFinalityMargin: parseNumericEnv('INDEXER_FINALITY_MARGIN', process.env.INDEXER_FINALITY_MARGIN, 10, { min: 1, integer: true }),
-  /** Ledger lag threshold before warning logs are emitted. */
-  indexerLagWarnThreshold: parseNumericEnv('INDEXER_LAG_WARN_THRESHOLD', process.env.INDEXER_LAG_WARN_THRESHOLD, 100, { min: 1, integer: true }),
+  indexer: {
+    /** Finality margin: ledgers to hold back from tip to avoid reorgs. */
+    finalityMargin: parseNumericEnv('INDEXER_FINALITY_MARGIN', process.env.INDEXER_FINALITY_MARGIN, 10, { min: 0, max: 1000, integer: true }),
+    /** Ledger lag threshold before warning logs are emitted. */
+    lagWarnThreshold: parseNumericEnv('INDEXER_LAG_WARN_THRESHOLD', process.env.INDEXER_LAG_WARN_THRESHOLD, 100, { min: 1, integer: true }),
+  },
 
   // ── Proxy settings ────────────────────────────────────────────────────
   /** Number of trusted reverse-proxy hops in front of this server (for IP resolution). */
@@ -849,6 +845,17 @@ const config = {
   webAuthDomain: process.env.WEB_AUTH_DOMAIN ?? '',
 
 };
+
+// ── Post-config validation ────────────────────────────────────────────────────
+
+// Validate shutdown configuration: prestopDelayMs must be less than timeoutMs
+if (config.shutdown.prestopDelayMs >= config.shutdown.timeoutMs) {
+  throw new Error(
+    `Invalid shutdown config: SHUTDOWN_PRESTOP_DELAY_MS (${config.shutdown.prestopDelayMs}) ` +
+    `must be less than SHUTDOWN_TIMEOUT_MS (${config.shutdown.timeoutMs}). ` +
+    `The pre-stop delay must leave time for the actual shutdown sequence.`,
+  );
+}
 
 export default config;
 
